@@ -19,8 +19,7 @@ const cmLanguage = require("@codemirror/language");
 const themeOn = () => getComputedStyle(document.body).getPropertyValue("--claude-style").trim() !== "";
 
 function chinese() {
-  const language = typeof obsidian.getLanguage === "function" ? obsidian.getLanguage() : (localStorage.getItem("language") ?? "en");
-  return language === "zh";
+  return obsidian.getLanguage() === "zh";
 }
 
 const state = {
@@ -179,6 +178,8 @@ return { extensionOf, cardName, fileCardInfo, isWidePicture, isFileTarget };
 })();
 
 const { fileCards } = (() => {
+const BLOCK = "claude-file-card-block";
+
 const WIKI_LINE = new RegExp("^\\[\\[([^\\]|#^]+)(?:\\|[^\\]]*)?\\]\\]\\s*$");
 const MARKDOWN_LINE = new RegExp("^\\[[^\\]]*\\]\\((?:<([^>]+)>|([^)\\s]+))\\)\\s*$");
 const HEADING = new RegExp("^#{1,6}(\\s|$)");
@@ -342,6 +343,7 @@ function editorCards(app, view) {
       if (!file) continue;
       const info = fileCardInfo(file.name, chinese());
       const widget = new FileCardWidget(app, info, pictureOf(app, file, info), target, sourcePath);
+      ranges.push(cmView.Decoration.line({ class: "claude-file-card-line" }).range(line.from));
       ranges.push(cmView.Decoration.replace({ widget }).range(line.from, line.to));
       cardLines.add(line.number);
     }
@@ -359,6 +361,7 @@ function fileCards(plugin) {
 
   plugin.registerMarkdownPostProcessor((el, ctx) => {
     if (state.unloaded || !themeOn()) return;
+    let holds = false;
     for (const p of Array.from(el.querySelectorAll("p"))) {
       if (p.closest("li, blockquote, .callout, table")) continue;
       const link = soleLink(p);
@@ -368,7 +371,13 @@ function fileCards(plugin) {
       const info = fileCardInfo(file.name, chinese());
       fillCard(link, info, pictureOf(app, file, info));
       p.classList.add("claude-file-card-p");
+      if (p.parentElement === el) holds = true;
+      else if (p.parentElement?.tagName === "DIV") p.parentElement.classList.add(BLOCK);
     }
+    if (el.tagName === "DIV") el.classList.toggle(BLOCK, holds);
+  });
+  plugin.register(() => {
+    for (const block of Array.from(document.querySelectorAll(`.${BLOCK}`))) block.classList.remove(BLOCK);
   });
 
   plugin.registerEditorExtension(
@@ -396,6 +405,7 @@ return { fileCards };
 
 const { sidebarSearch } = (() => {
 const ROW = "claude-search-row";
+const MARK = "claude-has-search-row";
 const COMMAND = "global-search:open";
 
 function addRow(app, bar) {
@@ -413,6 +423,7 @@ function addRow(app, bar) {
 
 function removeRows() {
   for (const row of Array.from(document.querySelectorAll(`.${ROW}`))) row.remove();
+  for (const split of Array.from(document.querySelectorAll(`.${MARK}`))) split.classList.remove(MARK);
 }
 
 function sync(app) {
@@ -423,6 +434,9 @@ function sync(app) {
   for (const leaf of app.workspace.getLeavesOfType("file-explorer")) {
     const bar = leaf.view.containerEl.querySelector(".nav-buttons-container");
     if (bar) addRow(app, bar);
+  }
+  for (const split of Array.from(document.querySelectorAll(".workspace-split.mod-left-split"))) {
+    split.classList.toggle(MARK, split.querySelector(`.${ROW}`) !== null);
   }
 }
 
@@ -438,12 +452,15 @@ return { sidebarSearch };
 
 const { vaultRoot } = (() => {
 const ROW = "claude-vault-root";
+const MARK = "claude-has-vault-root";
+const FOLDED = "claude-vault-collapsed";
 
 function removeRows() {
   for (const row of Array.from(document.querySelectorAll(`.${ROW}`))) row.remove();
+  for (const list of Array.from(document.querySelectorAll(`.${MARK}, .${FOLDED}`))) list.classList.remove(MARK, FOLDED);
 }
 
-function addRow(app, header) {
+function addRow(app, list, header) {
   if (header.querySelector(`.${ROW}`)) return;
   const row = createDiv({ cls: ["tree-item", "nav-folder", ROW] });
   const self = row.createDiv({ cls: ["tree-item-self", "nav-folder-title", "is-clickable", "mod-collapsible"] });
@@ -454,8 +471,11 @@ function addRow(app, header) {
     const folded = !row.hasClass("is-collapsed");
     row.toggleClass("is-collapsed", folded);
     collapse.toggleClass("is-collapsed", folded);
+    list.classList.toggle(FOLDED, folded);
   });
   header.appendChild(row);
+  list.classList.add(MARK);
+  list.classList.remove(FOLDED);
 }
 
 function sync(app) {
@@ -464,8 +484,9 @@ function sync(app) {
     return;
   }
   for (const leaf of app.workspace.getLeavesOfType("file-explorer")) {
-    const header = leaf.view.containerEl.querySelector(".nav-header");
-    if (header) addRow(app, header);
+    const list = leaf.view.containerEl;
+    const header = list.querySelector(".nav-header");
+    if (header) addRow(app, list, header);
   }
 }
 
@@ -481,6 +502,7 @@ return { vaultRoot };
 
 const { sidebarNav } = (() => {
 const GROUP = "claude-sidebar-nav";
+const MARK = "claude-has-sidebar-nav";
 
 function historyOf(leaf) {
   return leaf ? ((leaf ).history ?? null) : null;
@@ -493,6 +515,7 @@ function target(app) {
 
 function removeGroups() {
   for (const group of Array.from(document.querySelectorAll(`.${GROUP}`))) group.remove();
+  document.body.classList.remove(MARK);
 }
 
 function update(app) {
@@ -533,6 +556,7 @@ function sync(app) {
     }
     if (toggle.nextElementSibling !== group) toggle.after(group);
   }
+  document.body.classList.toggle(MARK, document.querySelector(`.${GROUP}`) !== null);
   update(app);
 }
 
@@ -617,6 +641,32 @@ function vaultMenu(plugin) {
 return { vaultMenu };
 })();
 
+const { printBlocks } = (() => {
+const HEADING = "claude-block-heading";
+const LIST = "claude-block-list";
+const HEADINGS = ["H1", "H2", "H3", "H4", "H5", "H6"];
+const LISTS = ["UL", "OL", "DL", "TABLE"];
+
+function name(block) {
+  if (block.tagName !== "DIV") return;
+  const kinds = Array.from(block.children, (child) => child.tagName);
+  block.classList.toggle(HEADING, kinds.some((kind) => HEADINGS.includes(kind)));
+  block.classList.toggle(LIST, kinds.some((kind) => LISTS.includes(kind)));
+}
+
+function printBlocks(plugin) {
+  plugin.registerMarkdownPostProcessor((el) => {
+    if (state.unloaded || !themeOn()) return;
+    if (el.classList.contains("markdown-rendered")) for (const block of Array.from(el.children)) name(block);
+    else name(el);
+  });
+  plugin.register(() => {
+    for (const block of Array.from(document.querySelectorAll(`.${HEADING}, .${LIST}`))) block.classList.remove(HEADING, LIST);
+  });
+}
+return { printBlocks };
+})();
+
 (() => {
 class ClaudeStyleEnhance extends obsidian.Plugin {
   async onload() {
@@ -628,6 +678,7 @@ class ClaudeStyleEnhance extends obsidian.Plugin {
     vaultRoot(this);
     sidebarNav(this);
     vaultMenu(this);
+    printBlocks(this);
 
     const later = obsidian.debounce(() => redraw(app), 200, true);
     this.registerEvent(app.workspace.on("css-change", later));
