@@ -768,7 +768,7 @@ function caretInEditor(plugin) {
 return { caretInEditor };
 })();
 
-const { startState, scanAll, rescan } = (() => {
+const { listChain, startState, scanAll, rescan } = (() => {
 const FENCE = new RegExp("^\\s*(`{3,}|~{3,})");
 const LIST_ITEM = new RegExp("^\\s*([-*+]|\\d{1,9}[.)])(\\s|$)");
 const INDENTED = new RegExp("^(\\s{2,}|\\t)\\S");
@@ -850,6 +850,27 @@ function levelOf(doc, number) {
     }
   }
   return { level: Math.min(level, 6), item: level > 0 ? item : 0 };
+}
+
+const TASK = new RegExp("^\\s*([-*+]|\\d{1,9}[.)])\\s+\\[.\\](\\s|$)");
+
+function listChain(doc, number) {
+  const text = doc.line(number).text;
+  if (!LIST_ITEM.test(text) || isQuote(text)) return [];
+  const chain = [TASK.test(text)];
+  let current = indent(text);
+  for (let n = number - 1; n >= 1 && current > 0; n--) {
+    const above = doc.line(n).text;
+    if (above.trim() === "") continue;
+    const at = indent(above);
+    if (LIST_ITEM.test(above) && at < current) {
+      chain.push(TASK.test(above));
+      current = at;
+    } else if (at === 0) {
+      break;
+    }
+  }
+  return chain;
 }
 
 function startState(doc) {
@@ -1129,7 +1150,7 @@ function rescan(data, doc, fromLine, oldTo, newTo, delta)
   for (const [n, v] of fresh.saved) data.saved.set(n, v);
   return { data, from: firstTouched, to: joined === null ? doc.lines : joined - 1 };
 }
-return { startState, scanAll, rescan };
+return { listChain, startState, scanAll, rescan };
 })();
 
 const { blankLinesInLivePreview } = (() => {
@@ -1264,6 +1285,13 @@ function quoteX(view, number, left) {
 
 const roundPx = (x) => `${Math.round(x * 64) / 64}px`;
 
+function itemTarget(view, number, lengths) {
+  const chain = listChain({ lines: view.state.doc.lines, line: (n) => view.state.doc.line(n) }, number);
+  if (chain.length === 0) return null;
+  const [self, ...around] = chain;
+  return around.reduce((x, task) => x + (task ? lengths.task : lengths.list), 0) + (self ? lengths.task + lengths.box : lengths.list);
+}
+
 function measurePlaces(view) {
   if (!active(view)) return new Map();
   const doc = view.state.doc;
@@ -1271,26 +1299,37 @@ function measurePlaces(view) {
   const want = new Map([...view.state.field(placing).styles].filter(([pos]) => !onScreen(pos)));
   const data = view.state.field(field).data;
   const left = view.contentDOM.getBoundingClientRect().left;
+  const css = getComputedStyle(view.contentDOM);
+  const length = (name) => Number.parseFloat(css.getPropertyValue(name)) || 0;
+  const lengths = { list: length("--claude-list-step"), task: length("--claude-task-step"), box: length("--claude-task-text") };
   const itemX = new Map();
   const xOf = (n) => {
-    if (!itemX.has(n)) itemX.set(n, n >= 1 && n <= doc.lines ? textX(view, n, left) : null);
+    if (!itemX.has(n)) itemX.set(n, n >= 1 && n <= doc.lines ? (lengths.list > 0 ? itemTarget(view, n, lengths) : null) ?? textX(view, n, left) : null);
     return itemX.get(n) ?? null;
   };
   for (const { from, to } of view.visibleRanges) {
     for (let n = doc.lineAt(from).number; n <= doc.lineAt(to).number; n++) {
+      const line = doc.line(n);
+      const target = lengths.list > 0 ? itemTarget(view, n, lengths) : null;
+      if (target !== null) {
+        const own = textX(view, n, left);
+        if (own === null) continue;
+        const shift = shiftNow(view, line.from, "--claude-item-shift") + target - own;
+        if (Math.abs(shift) >= 1 / 128) want.set(line.from, `--claude-item-shift: ${roundPx(shift)}`);
+        continue;
+      }
       const parent = data.parents.get(n);
       if (parent === undefined || parent === 0) continue;
-      const target = xOf(parent);
-      if (target === null) continue;
-      const line = doc.line(n);
+      const at = xOf(parent);
+      if (at === null) continue;
       if ((data.marks.get(n) ?? "").includes("claude-list-continuation")) {
         const own = textX(view, n, left);
-        if (own !== null) want.set(line.from, `--claude-cont-shift: ${roundPx(shiftNow(view, line.from, "--claude-cont-shift") + target - own)}`);
+        if (own !== null) want.set(line.from, `--claude-cont-shift: ${roundPx(shiftNow(view, line.from, "--claude-cont-shift") + at - own)}`);
       } else if (line.text.trimStart().startsWith(">")) {
         const own = quoteX(view, n, left);
-        if (own !== null) want.set(line.from, `--claude-quote-shift: ${roundPx(shiftNow(view, line.from, "--claude-quote-shift") + target - own)}`);
+        if (own !== null) want.set(line.from, `--claude-quote-shift: ${roundPx(shiftNow(view, line.from, "--claude-quote-shift") + at - own)}`);
       } else {
-        want.set(line.from, `--claude-list-shift: ${roundPx(target)}`);
+        want.set(line.from, `--claude-list-shift: ${roundPx(at)}`);
       }
     }
   }
