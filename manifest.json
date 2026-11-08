@@ -1,7 +1,7 @@
 {
   "id": "claude-style-enhance",
   "name": "Claude Style Enhance",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "minAppVersion": "1.15.0",
   "description": "Adds what the Claude Style theme cannot do with CSS alone, starting with file cards for files linked on a line of their own.",
   "author": "Xv-Bowen",

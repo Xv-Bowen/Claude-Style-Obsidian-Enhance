@@ -667,6 +667,720 @@ function printBlocks(plugin) {
 return { printBlocks };
 })();
 
+const { codeLanguages } = (() => {
+const PREFIX = "language-";
+const LANGUAGE = new RegExp("^[A-Za-z0-9+#._-]{1,40}$");
+
+function codeLanguages(plugin) {
+  plugin.registerMarkdownPostProcessor((el) => {
+    if (state.unloaded || !themeOn()) return;
+    for (const pre of Array.from(el.querySelectorAll(`pre[class*="${PREFIX}"]`))) {
+      const language = Array.from(pre.classList).find((c) => c.startsWith(PREFIX))?.slice(PREFIX.length) ?? "";
+      if (LANGUAGE.test(language)) pre.setAttribute("data-claude-lang", language);
+    }
+  }, 100);
+}
+return { codeLanguages };
+})();
+
+const { mathBreaks } = (() => {
+const BIN = 2;
+const REL = 3;
+const SCRIPT = "/lib/mathjax/obsidian-mathjax.js";
+
+const mathJax = () => (window ).MathJax;
+
+const filter = ({ math }) => {
+  if (state.unloaded || !themeOn()) return;
+  math.root.walkTree((node) => {
+    if (node.isKind("mo") && (node.texClass === BIN || node.texClass === REL)) node.attributes.set("linebreakstyle", "after");
+  });
+};
+
+function texInput() {
+  const inputs = mathJax()?.startup?.document?.inputJax;
+  if (!inputs) return undefined;
+  return (Array.isArray(inputs) ? inputs : Object.values(inputs)).find((jax) => jax.name === "TeX");
+}
+
+function mathBreaks(plugin) {
+  let added = null;
+  const add = () => {
+    if (added || state.unloaded) return added !== null;
+    const tex = texInput();
+    if (!tex) return false;
+    tex.postFilters.add(filter, 200);
+    added = tex;
+    return true;
+  };
+  plugin.register(() => {
+    added?.postFilters.remove(filter);
+    added = null;
+  });
+  if (add()) return;
+
+  const watch = new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of Array.from(record.addedNodes)) {
+        if (!(node instanceof HTMLScriptElement) || !node.src.endsWith(SCRIPT)) continue;
+        watch.disconnect();
+        const settings = mathJax();
+        if (!settings) return;
+        settings.startup ??= {};
+        const theirs = settings.startup.ready;
+        settings.startup.ready = function () {
+          if (theirs) theirs.call(this);
+          else mathJax()?.startup?.defaultReady?.();
+          add();
+        };
+        return;
+      }
+    }
+  });
+  watch.observe(document.body, { childList: true });
+  plugin.register(() => watch.disconnect());
+}
+return { mathBreaks };
+})();
+
+const { caretInEditor } = (() => {
+const flips = new WeakMap();
+
+function caretInEditor(plugin) {
+  plugin.registerEditorExtension([
+    cmView.EditorView.editorAttributes.compute([], () => ({ class: !state.unloaded && themeOn() ? "claude-caret-drawn" : "" })),
+    cmView.layer({
+      above: true,
+      class: "claude-caret-layer",
+      update: (update) => {
+        if (update.selectionSet || update.docChanged) flips.set(update.view, !flips.get(update.view));
+        return update.selectionSet || update.docChanged || update.viewportChanged || update.focusChanged || update.geometryChanged;
+      },
+      markers: (view) => {
+        const main = view.state.selection.main;
+        if (state.unloaded || !themeOn() || !view.hasFocus || !main.empty) return [];
+        const blink = flips.get(view) ? "claude-caret-a" : "claude-caret-b";
+        return cmView.RectangleMarker.forRange(view, `claude-caret ${blink}`, main);
+      },
+    }),
+  ]);
+}
+return { caretInEditor };
+})();
+
+const { startState, scanAll, rescan } = (() => {
+const FENCE = new RegExp("^\\s*(`{3,}|~{3,})");
+const LIST_ITEM = new RegExp("^\\s*([-*+]|\\d{1,9}[.)])(\\s|$)");
+const INDENTED = new RegExp("^(\\s{2,}|\\t)\\S");
+const HEADING = new RegExp("^(#{1,6})(\\s|$)");
+const TABLE_ROW = new RegExp("^\\s*\\|");
+const RULE = new RegExp("^\\s{0,3}((\\*\\s*){3,}|(-\\s*){3,}|(_\\s*){3,})$");
+const DASH_RULE = new RegExp("^\\s{0,3}(-\\s*){3,}$");
+const SETEXT = new RegExp("^\\s{0,3}(=+|-+)\\s*$");
+const LONE_LINK = new RegExp("^(\\[\\[[^\\]]+\\]\\]|\\[[^\\]]*\\]\\([^)]+\\))\\s*$");
+const SAVE_EVERY = 64;
+const LANGUAGE = new RegExp("^[A-Za-z0-9+#._-]{1,40}$");
+
+function before(line) {
+  if (HEADING.test(line)) return "heading";
+  if (LIST_ITEM.test(line)) return "list";
+  if (TABLE_ROW.test(line)) return "table";
+  if (RULE.test(line)) return "rule";
+  return "text";
+}
+
+function after(line) {
+  const heading = HEADING.exec(line);
+  if (heading) return `h${Math.min((heading[1] ?? "###").length, 3)}`;
+  if (LIST_ITEM.test(line)) return "list";
+  if (TABLE_ROW.test(line)) return "table";
+  if (RULE.test(line)) return "rule";
+  if (LONE_LINK.test(line)) return "card";
+  return "text";
+}
+
+const isQuote = (line) => line.trimStart().startsWith(">");
+
+function startsBlock(above, aboveIsFenceEnd, line) {
+  if (SETEXT.test(line) && !RULE.test(line)) return false;
+  const aboveText = before(above) === "text" && !INDENTED.test(above) && !aboveIsFenceEnd && !isQuote(above);
+  if (HEADING.test(above) || aboveIsFenceEnd || RULE.test(above)) return true;
+  if (HEADING.test(line) || FENCE.test(line)) return true;
+  if (LIST_ITEM.test(line)) return !(LIST_ITEM.test(above) || INDENTED.test(above));
+  if (isQuote(line)) return !isQuote(above);
+  if (RULE.test(line)) return !(aboveText && DASH_RULE.test(line));
+  return false;
+}
+
+function indent(line) {
+  let columns = 0;
+  for (const ch of line) {
+    if (ch === " ") columns += 1;
+    else if (ch === "\t") columns += 4 - (columns % 4);
+    else break;
+  }
+  return columns;
+}
+
+function drawn(line) {
+  let width = 0;
+  for (const ch of line) {
+    if (ch === " ") width += 1;
+    else if (ch === "\t") width += 4;
+    else break;
+  }
+  return width;
+}
+
+function levelOf(doc, number) {
+  let current = indent(doc.line(number).text);
+  if (current === 0) return { level: 0, item: 0 };
+  let level = 0;
+  let item = 0;
+  for (let n = number - 1; n >= 1 && current > 0; n--) {
+    const text = doc.line(n).text;
+    if (text.trim() === "") continue;
+    const at = indent(text);
+    if (LIST_ITEM.test(text) && at < current) {
+      level++;
+      if (item === 0) item = n;
+      current = at;
+    } else if (at === 0) {
+      break;
+    }
+  }
+  return { level: Math.min(level, 6), item: level > 0 ? item : 0 };
+}
+
+function startState(doc) {
+  return {
+    front: doc.lines > 1 && doc.line(1).text.trim() === "---",
+    fence: null,
+    fenceLevel: 0,
+    fenceIndent: 0,
+    fenceItem: 0,
+    contItem: 0,
+    maths: false,
+    comment: false,
+    prev: null,
+    prevKind: "text",
+    prevLine: 0,
+    prevIsFenceEnd: false,
+    inList: false,
+    unit: "other",
+    owed: 0,
+    run: [],
+  };
+}
+
+const copy = (s) => ({ ...s, run: s.run.slice() });
+
+const emptyData = () => ({ marks: new Map(), styles: new Map(), spacers: new Map(), parents: new Map(), saved: new Map() });
+
+function addTo(map, n, classes) {
+  const had = map.get(n);
+  map.set(n, had === undefined ? classes : `${had} ${classes}`);
+}
+
+function read(doc, s, n, out) {
+  const text = doc.line(n).text;
+  const trimmed = text.trim();
+  const mark = (line, classes) => addTo(out.marks, line, classes);
+  if (s.front) {
+    if (n > 1 && (trimmed === "---" || trimmed === "...")) s.front = false;
+    return;
+  }
+  const nested = (t) => s.inList && (LIST_ITEM.test(t) || INDENTED.test(t));
+  if (s.fence !== null) {
+    if (s.fenceLevel > 0) {
+      mark(n, `claude-list-level-${s.fenceLevel}`);
+      out.styles.set(n, `--claude-list-indent: ${Math.min(drawn(text), s.fenceIndent)}`);
+      out.parents.set(n, s.fenceItem);
+    }
+    if (trimmed.startsWith(s.fence)) {
+      s.fence = null;
+      s.fenceLevel = 0;
+      s.fenceIndent = 0;
+      s.fenceItem = 0;
+      s.prevKind = nested(text) ? "list" : "text";
+      s.unit = s.prevKind === "list" ? "fence" : "other";
+      s.owed = s.prevKind === "list" ? 1 : 0;
+      s.prev = text;
+      s.prevLine = n;
+      s.prevIsFenceEnd = true;
+    }
+    return;
+  }
+  if (s.maths) {
+    if (trimmed.endsWith("$$")) s.maths = false;
+    return;
+  }
+  if (s.comment) {
+    if (trimmed.includes("%%")) s.comment = false;
+    return;
+  }
+  if (trimmed === "") {
+    s.run.push(n);
+    return;
+  }
+  const adjacent = s.run.length === 0 && s.prevLine === n - 1;
+  const inside = nested(text) || (s.inList && adjacent && isQuote(text));
+  const item = LIST_ITEM.test(text);
+  const quote = isQuote(text);
+  const opens = FENCE.test(text);
+
+  let spacer = null;
+  if (s.prev !== null && adjacent && !(s.prevKind === "list" && inside) && startsBlock(s.prev, s.prevIsFenceEnd, text)) {
+    spacer = `claude-gap claude-gap-from-${s.prevKind} claude-gap-to-${after(text)}`;
+  }
+
+  if (quote && inside) {
+    const under = indent(text) > 0 ? levelOf(doc, n).item : 0;
+    const parent = under > 0 ? under : s.unit === "quote" ? (out.parents.get(n - 1) ?? 0) : s.contItem;
+    if (parent > 0) out.parents.set(n, parent);
+  }
+  const plain = inside && !item && !quote && !opens;
+  if (adjacent && ((s.unit === "quote" && (quote || plain)) || ((s.unit === "para" || s.unit === "item") && plain))) {
+    if (s.unit === "item") {
+      if (s.owed === 0) mark(s.prevLine, "claude-list-item-continued");
+      mark(n, "claude-list-continuation");
+      out.parents.set(n, s.contItem);
+      s.owed = 1;
+    }
+  } else {
+    let start = 0;
+    let next = "other";
+    if (item) next = "item";
+    else if (!inside) next = "other";
+    else if (opens) [next, start] = ["fence", 1];
+    else if (quote) [next, start] = ["quote", 1];
+    else if (adjacent && s.unit === "fence") [next, s.owed] = ["para", 0];
+    else [next, start] = ["para", s.run.length > 0 ? 1 : 0];
+    const space = s.owed + start;
+    const first = s.run[0];
+    if (space > 0) {
+      const pad = `claude-list-pad-top-${space}`;
+      if (first !== undefined && !(s.prevKind === "list" && inside)) mark(first, pad);
+      else if (spacer !== null) spacer += ` ${pad}`;
+      else if (!opens) mark(n, pad);
+      else if (!s.prevIsFenceEnd) mark(s.prevLine, `claude-list-pad-bottom-${space}`);
+    }
+    s.unit = next;
+    s.owed = next === "quote" || next === "para" ? 1 : 0;
+    s.contItem = next === "item" ? n : 0;
+  }
+
+  if (s.run.length > 0) {
+    const from = s.prev === null ? null : s.prevKind;
+    const to = inside ? "list" : after(text);
+    s.run.forEach((line, i) => {
+      if (from === null) mark(line, "claude-blank claude-blank-extra");
+      else if (from === "list" && to === "list") mark(line, "claude-blank claude-blank-list");
+      else if (i === 0) mark(line, `claude-blank claude-gap claude-gap-from-${from} claude-gap-to-${to}`);
+      else mark(line, "claude-blank claude-blank-extra");
+    });
+    s.run = [];
+  }
+  if (spacer !== null) out.spacers.set(n, spacer);
+
+  s.prevKind = inside ? "list" : before(text);
+  s.inList = inside || item;
+  const open = FENCE.exec(text);
+  if (open) {
+    s.fence = open[1] ?? null;
+    const { level, item: parent } = levelOf(doc, n);
+    s.fenceLevel = level;
+    s.fenceIndent = drawn(text);
+    s.fenceItem = parent;
+    const styles = [];
+    const language = trimmed.slice(s.fence?.length ?? 0).trim().split(new RegExp("\\s"))[0] ?? "";
+    if (LANGUAGE.test(language)) styles.push(`--claude-lang: "${language}"`);
+    if (s.fenceLevel > 0) {
+      mark(n, `claude-list-level-${s.fenceLevel}`);
+      styles.push(`--claude-list-indent: ${s.fenceIndent}`);
+      out.parents.set(n, s.fenceItem);
+    }
+    if (styles.length > 0) out.styles.set(n, styles.join("; "));
+  } else if (trimmed.startsWith("$$") && !(trimmed.length > 2 && trimmed.endsWith("$$"))) {
+    s.maths = true;
+  } else if (trimmed.startsWith("%%") && trimmed.indexOf("%%", 2) < 0) {
+    s.comment = true;
+  }
+  s.prev = text;
+  s.prevLine = n;
+  s.prevIsFenceEnd = false;
+}
+
+function finish(s, out) {
+  for (const line of s.run) addTo(out.marks, line, "claude-blank claude-blank-extra");
+}
+
+const quiet = (s) => !s.inList;
+
+function readFrom(doc, s, from, out, lastSaved,
+  stop) {
+  let saved = lastSaved;
+  for (let n = from; n <= doc.lines; n++) {
+    if (n > from && stop(n, s)) return n;
+    if (n - saved >= SAVE_EVERY && quiet(s)) {
+      out.saved.set(n, copy(s));
+      saved = n;
+    }
+    read(doc, s, n, out);
+  }
+  finish(s, out);
+  return null;
+}
+
+function scanAll(doc) {
+  const out = emptyData();
+  readFrom(doc, startState(doc), 1, out, 1, () => false);
+  return out;
+}
+
+function rescan(data, doc, fromLine, oldTo, newTo, delta)
+  {
+  const oldLines = doc.lines - delta;
+  let start = 1;
+  let s = startState(doc);
+  for (const [n, saved] of data.saved) {
+    if (n <= fromLine && n > start) {
+      start = n;
+      s = copy(saved);
+    }
+  }
+  if (start === 1) s = startState(doc);
+  const waiting = s.run.slice();
+  const firstTouched = waiting.length > 0 ? Math.min(start, ...waiting) : start;
+  const map = (n) => (n < fromLine ? n : n > oldTo ? n + delta : null);
+  const same = (a, oldState) => {
+    if (a.front !== oldState.front || a.fence !== oldState.fence || a.fenceLevel !== oldState.fenceLevel ||
+      a.fenceIndent !== oldState.fenceIndent || a.maths !== oldState.maths || a.comment !== oldState.comment ||
+      a.fenceItem !== (oldState.fenceItem === 0 ? 0 : map(oldState.fenceItem)) ||
+      a.contItem !== (oldState.contItem === 0 ? 0 : map(oldState.contItem)) ||
+      a.prev !== oldState.prev || a.prevKind !== oldState.prevKind || a.prevIsFenceEnd !== oldState.prevIsFenceEnd ||
+      a.inList !== oldState.inList || a.unit !== oldState.unit || a.owed !== oldState.owed) return false;
+    if (a.prevLine !== (oldState.prevLine === 0 ? 0 : map(oldState.prevLine))) return false;
+    if (a.run.length !== oldState.run.length) return false;
+    return a.run.every((line, i) => line === map(oldState.run[i] ?? -1));
+  };
+  const stop = (n, state) => {
+    if (n <= newTo) return false;
+    const oldState = data.saved.get(n - delta);
+    return oldState !== undefined && same(state, oldState);
+  };
+  const fresh = emptyData();
+  const joined = readFrom(doc, s, start, fresh, start, stop);
+  const oldJoin = joined === null ? oldLines + 1 : joined - delta;
+  const waitingAtJoin = joined === null ? [] : s.run.map((line) => [line, data.marks.get(line < fromLine ? line : line - delta)] );
+  for (const line of waiting) data.marks.delete(line);
+  for (let n = start; n < oldJoin; n++) {
+    data.marks.delete(n);
+    data.styles.delete(n);
+    data.spacers.delete(n);
+    data.parents.delete(n);
+    if (n > start) data.saved.delete(n);
+  }
+  if (delta !== 0 && joined !== null) {
+    const move = (map) => {
+      const moved = [];
+      for (let n = oldJoin; n <= oldLines; n++) {
+        const v = map.get(n);
+        if (v !== undefined) {
+          moved.push([n + delta, v]);
+          map.delete(n);
+        }
+      }
+      for (const [n, v] of moved) map.set(n, v);
+    };
+    move(data.marks);
+    move(data.styles);
+    move(data.spacers);
+    const parentsMoved = [];
+    for (let n = oldJoin; n <= oldLines; n++) {
+      const v = data.parents.get(n);
+      if (v === undefined) continue;
+      data.parents.delete(n);
+      parentsMoved.push([n + delta, map(v) ?? v]);
+    }
+    for (const [n, v] of parentsMoved) data.parents.set(n, v);
+    const savedMoved = [];
+    for (let n = oldJoin; n <= oldLines; n++) {
+      const v = data.saved.get(n);
+      if (v === undefined) continue;
+      data.saved.delete(n);
+      const prevLine = v.prevLine === 0 ? 0 : map(v.prevLine);
+      const fenceItem = v.fenceItem === 0 ? 0 : map(v.fenceItem);
+      const contItem = v.contItem === 0 ? 0 : map(v.contItem);
+      const run = v.run.map(map);
+      if (prevLine === null || fenceItem === null || contItem === null || run.some((line) => line === null)) continue;
+      savedMoved.push([n + delta, { ...v, prevLine, fenceItem, contItem, run: run }]);
+    }
+    for (const [n, v] of savedMoved) data.saved.set(n, v);
+  }
+  for (const [line, v] of waitingAtJoin) {
+    if (v === undefined) data.marks.delete(line);
+    else data.marks.set(line, v);
+  }
+  for (const [n, v] of fresh.marks) addTo(data.marks, n, v);
+  for (const [n, v] of fresh.styles) data.styles.set(n, v);
+  for (const [n, v] of fresh.spacers) data.spacers.set(n, v);
+  for (const [n, v] of fresh.parents) data.parents.set(n, v);
+  for (const [n, v] of fresh.saved) data.saved.set(n, v);
+  return { data, from: firstTouched, to: joined === null ? doc.lines : joined - 1 };
+}
+return { startState, scanAll, rescan };
+})();
+
+const { blankLinesInLivePreview } = (() => {
+const TEXT_START = new RegExp("^([>\\s]*)(([*+-] |(\\d+)([.)] ))(?:\\[(.)\\] )?)?");
+
+class Spacer extends cmView.WidgetType {
+  classes;
+  constructor(classes) {
+    super();
+    this.classes = classes;
+  }
+  eq(other) {
+    return other.classes === this.classes;
+  }
+  toDOM() {
+    const el = document.createElement("div");
+    el.className = `claude-gap-spacer ${this.classes}`;
+    el.setAttribute("aria-hidden", "true");
+    return el;
+  }
+  ignoreEvent() {
+    return false;
+  }
+}
+
+function decorate(doc, data, from, to) {
+  const out = [];
+  for (let n = Math.max(1, from); n <= Math.min(to, doc.lines); n++) {
+    const pos = doc.line(n).from;
+    const spacer = data.spacers.get(n);
+    if (spacer !== undefined) out.push(cmView.Decoration.widget({ widget: new Spacer(spacer), block: true, side: -1 }).range(pos));
+    const classes = data.marks.get(n);
+    const style = data.styles.get(n);
+    if (classes !== undefined || style !== undefined) {
+      out.push(cmView.Decoration.line({ class: classes ?? "", attributes: style === undefined ? {} : { style } }).range(pos));
+    }
+  }
+  return out;
+}
+
+const shownNow = () => !state.unloaded && themeOn();
+
+const field = cmState.StateField.define({
+  create(s) {
+    const data = scanAll(s.doc);
+    return { data, decorations: cmView.Decoration.set(decorate(s.doc, data, 1, s.doc.lines), true), version: state.version, shown: shownNow() };
+  },
+  update(value, tr) {
+    let next = value;
+    if (tr.docChanged) {
+      const oldDoc = tr.startState.doc;
+      const doc = tr.state.doc;
+      let fromA = Infinity;
+      let toA = -1;
+      let toB = -1;
+      tr.changes.iterChangedRanges((a0, a1, _b0, b1) => {
+        fromA = Math.min(fromA, a0);
+        toA = Math.max(toA, a1);
+        toB = Math.max(toB, b1);
+      });
+      const fromLine = oldDoc.lineAt(fromA).number;
+      const { data, from, to } = rescan(value.data, doc, fromLine, oldDoc.lineAt(toA).number, doc.lineAt(toB).number, doc.lines - oldDoc.lines);
+      const fromPos = doc.line(Math.max(1, Math.min(from, doc.lines))).from;
+      const toPos = doc.line(Math.min(to, doc.lines)).to;
+      const decorations = value.decorations.map(tr.changes).update({
+        filterFrom: fromPos,
+        filterTo: toPos,
+        filter: () => false,
+        add: decorate(doc, data, from, to),
+        sort: true,
+      });
+      next = { ...next, data, decorations };
+    }
+    if (next.version !== state.version) next = { ...next, version: state.version, shown: shownNow() };
+    return next;
+  },
+});
+
+const shown = cmView.EditorView.decorations.compute([field, obsidian.editorLivePreviewField], (s) => {
+  const value = s.field(field);
+  return value.shown && s.field(obsidian.editorLivePreviewField, false) === true ? value.decorations : cmView.Decoration.none;
+});
+
+const placed = cmState.StateEffect.define();
+
+const placing = cmState.StateField.define({
+  create: () => ({ styles: new Map(), decorations: cmView.Decoration.none }),
+  update(value, tr) {
+    let next = value;
+    if (tr.docChanged) {
+      const styles = new Map();
+      for (const [pos, style] of value.styles) {
+        const moved = tr.changes.mapPos(pos, -1, cmState.MapMode.TrackDel);
+        if (moved !== null) styles.set(moved, style);
+      }
+      next = { styles, decorations: value.decorations.map(tr.changes) };
+    }
+    for (const effect of tr.effects) {
+      if (!effect.is(placed)) continue;
+      const ranges = [];
+      for (const [pos, style] of effect.value) ranges.push(cmView.Decoration.line({ attributes: { style } }).range(pos));
+      next = { styles: effect.value, decorations: cmView.Decoration.set(ranges, true) };
+    }
+    return next;
+  },
+  provide: (f) => cmView.EditorView.decorations.from(f, (v) => v.decorations),
+});
+
+function textX(view, number, left) {
+  const line = view.state.doc.line(number);
+  const marker = TEXT_START.exec(line.text);
+  const at = view.coordsAtPos(line.from + (marker?.[0].length ?? 0), 1);
+  return at ? at.left - left : null;
+}
+
+function shiftNow(view, pos, name) {
+  const node = view.domAtPos(pos).node;
+  const line = (node instanceof HTMLElement ? node : node.parentElement)?.closest(".cm-line");
+  return line ? Number.parseFloat(getComputedStyle(line).getPropertyValue(name)) || 0 : 0;
+}
+
+function quoteX(view, number, left) {
+  const line = view.state.doc.line(number);
+  const pos = line.from + line.text.indexOf(">");
+  const at = view.coordsAtPos(pos, 1);
+  if (!at) return null;
+  const node = view.domAtPos(pos + 1).node;
+  const mark = (node instanceof HTMLElement ? node : node.parentElement)?.closest(".cm-formatting-quote-1");
+  const inset = mark ? Number.parseFloat(getComputedStyle(mark).paddingInlineStart) || 0 : 0;
+  return at.left - left - inset;
+}
+
+const roundPx = (x) => `${Math.round(x * 64) / 64}px`;
+
+function measurePlaces(view) {
+  if (!active(view)) return new Map();
+  const doc = view.state.doc;
+  const onScreen = (pos) => view.visibleRanges.some((r) => pos >= r.from && pos <= r.to);
+  const want = new Map([...view.state.field(placing).styles].filter(([pos]) => !onScreen(pos)));
+  const data = view.state.field(field).data;
+  const left = view.contentDOM.getBoundingClientRect().left;
+  const itemX = new Map();
+  const xOf = (n) => {
+    if (!itemX.has(n)) itemX.set(n, n >= 1 && n <= doc.lines ? textX(view, n, left) : null);
+    return itemX.get(n) ?? null;
+  };
+  for (const { from, to } of view.visibleRanges) {
+    for (let n = doc.lineAt(from).number; n <= doc.lineAt(to).number; n++) {
+      const parent = data.parents.get(n);
+      if (parent === undefined || parent === 0) continue;
+      const target = xOf(parent);
+      if (target === null) continue;
+      const line = doc.line(n);
+      if ((data.marks.get(n) ?? "").includes("claude-list-continuation")) {
+        const own = textX(view, n, left);
+        if (own !== null) want.set(line.from, `--claude-cont-shift: ${roundPx(shiftNow(view, line.from, "--claude-cont-shift") + target - own)}`);
+      } else if (line.text.trimStart().startsWith(">")) {
+        const own = quoteX(view, n, left);
+        if (own !== null) want.set(line.from, `--claude-quote-shift: ${roundPx(shiftNow(view, line.from, "--claude-quote-shift") + target - own)}`);
+      } else {
+        want.set(line.from, `--claude-list-shift: ${roundPx(target)}`);
+      }
+    }
+  }
+  return want;
+}
+
+const sameStyles = (a, b) =>
+  a.size === b.size && [...a].every(([k, v]) => b.get(k) === v);
+
+const placer = cmView.ViewPlugin.fromClass(class {
+  constructor(view) {
+    this.schedule(view);
+  }
+  update(update) {
+    if (update.docChanged || update.viewportChanged || update.geometryChanged ||
+      update.transactions.some((t) => t.effects.some((e) => e.is(placed)))) this.schedule(update.view);
+  }
+  schedule(view) {
+    view.requestMeasure({
+      key: this,
+      read: (v) => measurePlaces(v),
+      write: (want, v) => {
+        if (sameStyles(want, v.state.field(placing).styles)) return;
+        window.setTimeout(() => {
+          if (!sameStyles(want, v.state.field(placing).styles)) v.dispatch({ effects: placed.of(want) });
+        }, 0);
+      },
+    });
+  }
+});
+
+function active(view) {
+  return !state.unloaded && themeOn() && view.state.field(obsidian.editorLivePreviewField, false) === true;
+}
+
+function vertical(app, view, forward, extend) {
+  if (!active(view) || view.composing || view.state.selection.ranges.length !== 1) return false;
+  if (view.dom.ownerDocument.querySelector(".suggestion-container, .cm-tooltip-autocomplete")) return false;
+  if ((app.vault ).getConfig?.("vimMode") === true) return false;
+  const range = view.state.selection.main;
+  if (!extend && !range.empty) return false;
+  const moved = view.moveVertically(range, forward);
+  const doc = view.state.doc;
+  const from = doc.lineAt(range.head).number;
+  const to = doc.lineAt(moved.head).number;
+  const step = forward ? 1 : -1;
+  if ((to - from) * step <= 1) return false;
+  for (let n = from + step; n !== to; n += step) if (doc.line(n).text.trim() !== "") return false;
+  const head = doc.line(from + step).from;
+  let goal = moved.goalColumn;
+  const line = doc.line(from);
+  const marker = TEXT_START.exec(line.text);
+  if (goal !== undefined && marker?.[2] !== undefined) {
+    const text = view.coordsAtPos(line.from + marker[0].length);
+    const blank = view.coordsAtPos(head);
+    if (text && blank) goal += blank.left - text.left;
+  }
+  const target = extend
+    ? cmState.EditorSelection.range(range.anchor, head, goal)
+    : cmState.EditorSelection.cursor(head, 0, undefined, goal);
+  view.dispatch({ selection: cmState.EditorSelection.create([target]), scrollIntoView: true, userEvent: "select" });
+  return true;
+}
+
+function measureAll(app) {
+  for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+    const view = leaf.view ;
+    view.editor?.cm?.requestMeasure();
+  }
+}
+
+function blankLinesInLivePreview(plugin) {
+  const app = plugin.app;
+  plugin.registerEditorExtension([
+    field,
+    shown,
+    placing,
+    placer,
+    cmState.Prec.highest(cmView.keymap.of([
+      { key: "ArrowDown", run: (view) => vertical(app, view, true, false), shift: (view) => vertical(app, view, true, true) },
+      { key: "ArrowUp", run: (view) => vertical(app, view, false, false), shift: (view) => vertical(app, view, false, true) },
+    ])),
+  ]);
+  const later = obsidian.debounce(() => measureAll(app), 100, true);
+  plugin.registerEvent(app.workspace.on("css-change", later));
+  app.workspace.onLayoutReady(later);
+}
+return { blankLinesInLivePreview };
+})();
+
 (() => {
 class ClaudeStyleEnhance extends obsidian.Plugin {
   async onload() {
@@ -679,6 +1393,10 @@ class ClaudeStyleEnhance extends obsidian.Plugin {
     sidebarNav(this);
     vaultMenu(this);
     printBlocks(this);
+    codeLanguages(this);
+    caretInEditor(this);
+    mathBreaks(this);
+    blankLinesInLivePreview(this);
 
     const later = obsidian.debounce(() => redraw(app), 200, true);
     this.registerEvent(app.workspace.on("css-change", later));
